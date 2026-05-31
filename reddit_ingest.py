@@ -1,33 +1,21 @@
 #!/usr/bin/env python3
 """
-fantell-reddit-ingest — minimal, honest Reddit fan-signal ingester for FanTell.
+reddit_ingest — a small, public-content Reddit comment collector.
 
-This is a reference implementation of the "discover → dedup → normalise → freshness-stamp → write"
-pipeline from Soc's social-ingestion playbook. It pulls public comments from UK-football subreddits
-via Reddit's OAuth2 script-app flow (password grant), pseudonymises authors with a salted hash, and
-emits normalised evidence records as JSON lines (the FanTell `evidence_records` shape).
-
-It does NOT write to Postgres directly — it prints/writes JSONL so it's safe to run anywhere and the
-DB write-path stays owned by the FanTell app (Kop/Logbook contract on vpsf). Point it at a file or pipe.
-
-Design rules (from the playbook):
-- Spine = /r/{sub}/comments (new comments), NOT search; /new for posts.
-- Multi-sub in one call to save rate budget: /r/a+b+c/comments
-- Back off on the X-Ratelimit headers, never a fixed sleep.
-- Edits/deletes are silent → append a new record on re-observe, never mutate.
-- Pseudonymise author at ingest (salted SHA-256); never store the raw username.
-- Public content only. No DMs, no private subs.
+Polls new comments from one or more public subreddits via Reddit's official OAuth2 API
+(script app, password grant), pseudonymises the author with a salted hash, de-duplicates on
+content, and writes normalised JSON-lines records. Read-only, public content only.
 
 Usage:
-    export REDDIT_CLIENT_ID=...        # from old.reddit.com/prefs/apps (script app)
+    export REDDIT_CLIENT_ID=...        # from old.reddit.com/prefs/apps (type: script)
     export REDDIT_CLIENT_SECRET=...
-    export REDDIT_USERNAME=fantell_ingest
+    export REDDIT_USERNAME=...         # the bot/automation account
     export REDDIT_PASSWORD=...
-    export REDDIT_USER_AGENT="fantell-kop/0.1 by /u/fantell_ingest"
-    export KOP_AUTHOR_SALT="<random-32+ char secret>"   # any long random string
-    python3 reddit_ingest.py --subs soccer Gunners reddevils --limit 100 --out evidence.jsonl
+    export REDDIT_USER_AGENT="reddit-ingest/0.1 by /u/<username>"
+    export AUTHOR_SALT="<random secret string>"
+    python3 reddit_ingest.py --subs soccer --limit 100 --out comments.jsonl
 
-Dependencies: just `requests`  (pip install requests)
+Dependency: requests  (pip install requests)
 """
 from __future__ import annotations
 import argparse, hashlib, json, os, sys, time
@@ -38,25 +26,20 @@ import requests
 TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 API_BASE = "https://oauth.reddit.com"
 
-# Default UK-football subreddit cluster (clubs + the general sub). Extend freely.
-DEFAULT_SUBS = ["soccer", "Gunners", "reddevils", "LiverpoolFC", "chelseafc", "MCFC", "coys"]
-
 
 def env(name: str, required: bool = True) -> str:
     v = os.environ.get(name, "").strip()
     if required and not v:
-        sys.exit(f"ERROR: environment variable {name} is not set. See the README / module docstring.")
+        sys.exit(f"ERROR: environment variable {name} is not set (see the module docstring).")
     return v
 
 
 def get_token(s: requests.Session) -> str:
     """OAuth2 'password' grant for a Reddit *script* app."""
     auth = requests.auth.HTTPBasicAuth(env("REDDIT_CLIENT_ID"), env("REDDIT_CLIENT_SECRET"))
-    data = {
-        "grant_type": "password",
-        "username": env("REDDIT_USERNAME"),
-        "password": env("REDDIT_PASSWORD"),
-    }
+    data = {"grant_type": "password",
+            "username": env("REDDIT_USERNAME"),
+            "password": env("REDDIT_PASSWORD")}
     r = s.post(TOKEN_URL, auth=auth, data=data,
                headers={"User-Agent": env("REDDIT_USER_AGENT")}, timeout=20)
     r.raise_for_status()
@@ -64,15 +47,14 @@ def get_token(s: requests.Session) -> str:
 
 
 def author_hash(username: str, salt: str) -> str | None:
-    """Salted SHA-256 of the author. Returns None for deleted/removed authors.
-    We NEVER store the raw username — only this irreversible pseudonym (GDPR posture)."""
+    """Salted SHA-256 of the author; None for deleted/removed. The raw username is never stored."""
     if not username or username in ("[deleted]", "[removed]", "AutoModerator"):
         return None
     return "sha256:" + hashlib.sha256((salt + ":" + username).encode("utf-8")).hexdigest()[:32]
 
 
 def backoff_on_headers(resp: requests.Response) -> None:
-    """Respect Reddit's rate-limit headers; sleep only when the remaining budget is low."""
+    """Respect Reddit's rate-limit headers; sleep only when remaining budget is low."""
     try:
         remaining = float(resp.headers.get("X-Ratelimit-Remaining", "100"))
         reset = float(resp.headers.get("X-Ratelimit-Reset", "0"))
@@ -84,9 +66,8 @@ def backoff_on_headers(resp: requests.Response) -> None:
 
 
 def fetch_comments(s: requests.Session, token: str, subs: list[str], limit: int) -> list[dict]:
-    """One poll of /r/{a+b+c}/comments — the high-frequency fan-sentiment tap."""
-    multi = "+".join(subs)
-    url = f"{API_BASE}/r/{multi}/comments"
+    """One poll of /r/{a+b+c}/comments (new comments across the listed subs)."""
+    url = f"{API_BASE}/r/{'+'.join(subs)}/comments"
     headers = {"Authorization": f"bearer {token}", "User-Agent": env("REDDIT_USER_AGENT")}
     r = s.get(url, headers=headers, params={"limit": limit}, timeout=20)
     backoff_on_headers(r)
@@ -95,66 +76,62 @@ def fetch_comments(s: requests.Session, token: str, subs: list[str], limit: int)
 
 
 def normalise(c: dict, salt: str) -> dict:
-    """Map a raw Reddit comment to the FanTell evidence_records shape.
-    Note observed_at (now) vs event_at (when posted) kept separate — the gap is real latency."""
+    """Map a raw Reddit comment to a flat record. observed_at (now) and event_at (posted) are
+    kept separate so latency is explicit."""
     now = datetime.now(timezone.utc).isoformat()
     event_at = datetime.fromtimestamp(c.get("created_utc", 0), tz=timezone.utc).isoformat()
     body = (c.get("body") or "").strip()
     return {
-        "source_kind": "reddit",
-        "source_subreddit": c.get("subreddit"),
-        "content_anchor": f"https://reddit.com{c.get('permalink', '')}",
-        "excerpt": body[:1000],                       # cap; full text not retained verbatim
+        "source": "reddit",
+        "subreddit": c.get("subreddit"),
+        "permalink": f"https://reddit.com{c.get('permalink', '')}",
+        "excerpt": body[:1000],
         "author_hash": author_hash(c.get("author", ""), salt),
-        "score_at_observed": c.get("score"),          # time-series signal, not truth-at-ingest
-        "is_edited": bool(c.get("edited")),
-        "removed": c.get("body") in ("[removed]", "[deleted]"),
-        "event_at": event_at,                         # when the user posted
-        "observed_at": now,                           # when we ingested
-        "reliability_tier": 3,                        # social = tertiary; discounted downstream
-        "ingester": "kop",
+        "score": c.get("score"),
+        "edited": bool(c.get("edited")),
+        "removed": body in ("[removed]", "[deleted]"),
+        "event_at": event_at,
+        "observed_at": now,
         "dedup_key": hashlib.sha256(
             (str(c.get("subreddit")) + "|" + body[:200] + "|" + event_at[:16]).encode()
-        ).hexdigest()[:16],                           # content+time bucket, NOT comment id
+        ).hexdigest()[:16],
     }
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="FanTell Reddit fan-signal ingester (reference).")
-    ap.add_argument("--subs", nargs="*", default=DEFAULT_SUBS, help="subreddits (no r/ prefix)")
+    ap = argparse.ArgumentParser(description="Collect public Reddit comments to JSONL.")
+    ap.add_argument("--subs", nargs="*", default=["soccer"], help="subreddits (no r/ prefix)")
     ap.add_argument("--limit", type=int, default=100, help="comments per poll (max 100)")
-    ap.add_argument("--polls", type=int, default=1, help="number of polls (1 = single shot)")
-    ap.add_argument("--interval", type=float, default=5.0, help="seconds between polls (adaptive ceiling)")
+    ap.add_argument("--polls", type=int, default=1, help="number of polls")
+    ap.add_argument("--interval", type=float, default=5.0, help="seconds between polls")
     ap.add_argument("--out", default="-", help="output JSONL file, or - for stdout")
     args = ap.parse_args()
 
-    salt = env("KOP_AUTHOR_SALT")
+    salt = env("AUTHOR_SALT")
     s = requests.Session()
     token = get_token(s)
-    print(f"[auth] got token; polling {len(args.subs)} subs: {', '.join(args.subs)}", file=sys.stderr)
+    print(f"[auth] token acquired; polling: {', '.join(args.subs)}", file=sys.stderr)
 
     out = sys.stdout if args.out == "-" else open(args.out, "a", encoding="utf-8")
     seen: set[str] = set()
     total = 0
     try:
         for poll in range(args.polls):
-            comments = fetch_comments(s, token, args.subs, args.limit)
-            for c in comments:
+            for c in fetch_comments(s, token, args.subs, args.limit):
                 rec = normalise(c, salt)
-                if rec["dedup_key"] in seen:          # dedup on content, not id
+                if rec["dedup_key"] in seen:
                     continue
                 seen.add(rec["dedup_key"])
                 out.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 total += 1
             out.flush()
-            print(f"[poll {poll+1}/{args.polls}] {len(comments)} fetched, {total} unique total",
-                  file=sys.stderr)
+            print(f"[poll {poll+1}/{args.polls}] {total} unique total", file=sys.stderr)
             if poll + 1 < args.polls:
                 time.sleep(args.interval)
     finally:
         if out is not sys.stdout:
             out.close()
-    print(f"[done] {total} unique evidence records written", file=sys.stderr)
+    print(f"[done] {total} records written", file=sys.stderr)
 
 
 if __name__ == "__main__":
